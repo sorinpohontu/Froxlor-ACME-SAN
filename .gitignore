@@ -1,0 +1,13 @@
+.DS_Store
+.idea/
+.vscode/
+
+# Local docs
+/docs/
+/reference/
+
+# Local config
+/acme.local.php
+
+# Runtime logs
+*.log
