@@ -1,22 +1,30 @@
 # Froxlor ACME SAN
 
-`acme.php` generates SAN certificates with [acme.sh](https://github.com/acmesh-official/acme.sh) for active primary domains managed by Froxlor. It builds separate certificates for configurable service prefixes such as `mail`, `webmail`, and `dav`, validates DNS, installs certificate files, and runs each successful post-generation command once.
+Generate and renew service certificates for the active customer domains managed by Froxlor. The script creates one SAN certificate per service definition—for example `mail`, `webmail`, or `dav`—using Froxlor's [acme.sh](https://github.com/acmesh-official/acme.sh) configuration.
+
+It provides:
+
+- Automatic discovery of active primary Froxlor domains
+- A separate certificate and post-command for each configured service
+- A and AAAA validation before names are sent to acme.sh
+- Automatic renewal when a certificate is due or its domain set changes
+- Error notifications through Froxlor's own mailer
+- Safe dry runs and single-certificate execution
+- Optional cron and logrotate installation
 
 ## Requirements
 
-- PHP 7.4 or newer with PDO MySQL and DNS support (matching Froxlor v2)
-- A working Froxlor installation and readable `userdata.inc.php`
-- `acme.sh` configured by Froxlor
-- Permission to read Froxlor settings, write the certificate and lock paths, and run configured service commands
+- PHP 7.4 or newer with PDO MySQL and DNS support
+- Froxlor v2 with a readable `lib/userdata.inc.php`
+- Froxlor's acme.sh installation and HTTP challenge path
+- Root, or an equivalent trusted administrative account
 - Network access for DNS resolution and ACME challenges
 
-The script is intended to run from the command line under a trusted administrative account. Local configuration and post-generation commands must be treated as root-level configuration.
+The execution account must be able to read Froxlor's configuration, write the certificate and lock paths, and run every configured post-command.
 
-Before its first timestamped message, the script detects the operating-system timezone from `/etc/timezone`, the `/etc/localtime` zoneinfo link, or `timedatectl`. A detected identifier is validated against PHP's timezone database before it is applied; if detection fails, PHP's configured timezone remains in effect. Daylight-saving changes are handled by the selected timezone identifier.
+## Quick start
 
-## Installation
-
-Install the project in `/opt/AcmeSan`. Copy the example configuration and restrict access to the resulting local file:
+Place the project in `/opt/AcmeSan`, then create the machine-local configuration:
 
 ```sh
 cd /opt/AcmeSan
@@ -24,99 +32,145 @@ cp acme.local.example.php acme.local.php
 chmod 600 acme.local.php
 ```
 
-Review every local value before the first run. `acme.local.php` is ignored by Git.
+Review `acme.local.php`, especially the complete `certificates` map and its service reload commands. The local file is ignored by Git and should remain readable only by its administrator.
 
-## Configuration sources and precedence
-
-The script combines four sources in this order:
-
-1. General defaults in `acme.php`
-2. ACME settings and the mail system provided by Froxlor
-3. Overrides returned by `acme.local.php`
-4. Command-line operational flags
-
-The Froxlor credentials path is resolved before connecting to the database: the built-in default can be replaced by `froxlor_config` locally and then by `--froxlor-config=PATH` on the command line.
-
-The script automatically loads `acme.local.php` from its own directory when it exists. Use `--local-config=PATH` to select a different file; an explicitly selected file is required and invalid or unknown configuration keys are rejected.
-
-Local configuration must return an array. See [`acme.local.example.php`](acme.local.example.php) for every supported section. Scalar fields replace defaults, `acme` and notification preferences merge by named key, and a local `certificates` section replaces the complete built-in certificate map. Lists such as `subdomains` and `additional_domains` are replacements, not additions.
-
-Froxlor manages the notification recipient and mail transport. Local configuration can enable or disable error notifications and change their subject, but cannot replace Froxlor's recipient or transport settings. ACME settings can still be overridden locally when required.
-
-## Command-line options
-
-```text
---froxlor-config=PATH       Use a different Froxlor userdata.inc.php
---local-config=PATH         Require a different local configuration file
---certificate=TYPE         Process one configured certificate type
---install                  Install cron and logrotate for this script
---dry-run                   Show actions without certificate or service changes
---test-email                With --dry-run, send one test email through Froxlor
---no-email                  Disable error notifications
---skip-dns-validation       Skip DNS validation
---force                     Force certificate generation
---help                      Show built-in help
-```
-
-Unknown options, positional arguments, and the removed `--config-path` option are rejected. Invocation and configuration errors exit with status `2`; operational failures exit with status `1`.
-
-Start with help and a dry run:
+Check the command and effective domain sets without creating certificates:
 
 ```sh
 /usr/bin/php /opt/AcmeSan/acme.php --help
 /usr/bin/php /opt/AcmeSan/acme.php --dry-run
+```
+
+Optionally verify Froxlor mail delivery:
+
+```sh
 /usr/bin/php /opt/AcmeSan/acme.php --dry-run --test-email
 ```
 
-Before a scoped forced renewal, verify the selected certificate with a dry run:
+Run one monitored, non-forced certificate cycle before installing the scheduler:
 
 ```sh
-/usr/bin/php /opt/AcmeSan/acme.php --dry-run --certificate=mail
-/usr/bin/php /opt/AcmeSan/acme.php --force --certificate=mail
+/usr/bin/php /opt/AcmeSan/acme.php
+echo $?
 ```
 
-The selected type must exist in the effective `certificates` map after local configuration is applied. A forced live run requests a certificate from the configured CA, replaces its output files on success, and runs that type's configured post-command. Run it only during a monitored service window.
+A current certificate with an unchanged domain set is skipped normally and returns `0`. Do not add `--force` to routine or scheduled executions.
 
-An explicit configuration can be checked with:
+## Local configuration
+
+The script automatically loads `acme.local.php` beside `acme.php` when it exists. To require another file, use an absolute path:
 
 ```sh
-/usr/bin/php /opt/AcmeSan/acme.php --dry-run --local-config=/opt/AcmeSan/acme.local.php
+/usr/bin/php /opt/AcmeSan/acme.php \
+  --dry-run \
+  --local-config=/path/to/acme.local.php
 ```
 
-Dry runs still read Froxlor and perform DNS lookups, but do not create the process lock, certificate directories, certificates, or service reloads. They do not send email unless `--test-email` is explicitly supplied. `--test-email` requires `--dry-run` and cannot be combined with `--no-email`.
+Configuration is applied in this order, with later sources taking precedence:
 
-## Certificates and DNS
+1. General defaults in `acme.php`
+2. Froxlor ACME and mail settings
+3. `acme.local.php`
+4. Command-line operational flags
 
-For every configured certificate type, the server hostname is the primary name. Configured prefixes are prepended to each active primary Froxlor domain and each `additional_domains` entry. Duplicate names are removed while preserving order.
+`froxlor_config` is resolved earlier because it is needed to connect to the database. Its precedence is the built-in path, the local value, then `--froxlor-config=PATH`.
 
-Use `--certificate=TYPE` to restrict processing to one configured certificate. Without it, every configured certificate type is processed.
+See [acme.local.example.php](acme.local.example.php) for every supported field. Unknown fields and invalid values are rejected. Scalar values replace defaults; `acme` and `email` merge by key; lists replace rather than append.
 
-DNS validation retains names whose A or AAAA records match an address detected on the server. Failed names are excluded and reported. `--skip-dns-validation` is intended for deliberate troubleshooting and should not normally be used by cron.
+Important: supplying `certificates` replaces the entire built-in certificate map. Include every certificate type that should remain active.
 
-Certificates default to `/etc/ssl/acme-sans/<type>/`. The script writes `cert.pem`, `key.pem`, and `fullchain.pem`, then restricts successful output files to mode `0600` and their certificate directory to `0700`.
+### Certificate definitions
 
-Certificate authorities impose limits on names per certificate. Keep each generated SAN set within the current limits of the configured CA; this script does not split a certificate automatically.
+A certificate definition has this shape:
 
-## Notifications and post-commands
+```php
+'dba' => [
+    'subdomains'                  => ['dba'],
+    'include_hostname_subdomains' => true,
+    'additional_domains'          => [],
+    'post_command'                => 'systemctl restart apache2',
+],
+```
 
-Froxlor's administrator email, sender, reply-to address, and transport configuration are authoritative. The script loads Froxlor v2's own `Froxlor\System\Mailer`, so `mail_use_smtp` and all related SMTP behavior are interpreted by Froxlor rather than duplicated here. Local configuration controls only notification enablement and subject, while `--no-email` disables notification for one run. Normal notifications are sent only for errors and are disabled during dry runs; `--test-email` is the explicit exception for testing delivery.
+For a server named `vstore.example.net`, this definition starts with:
 
-Post-generation commands run only for certificate types that completed successfully. Identical commands are deduplicated and run once after all certificate attempts. They are trusted shell commands: never accept their values from an untrusted source.
+```text
+vstore.example.net
+dba.vstore.example.net
+```
 
-acme.sh exit status `2` means renewal was skipped because it is not currently required. The script logs that result as normal, does not send an error notification, and does not reload services for the unchanged certificate.
+The bare server hostname is always the first SAN. `include_hostname_subdomains` defaults to `false`; enable it only when each `<prefix>.<server-hostname>` is a real service name with working DNS.
 
-## Cron
+Each prefix is also applied to every active primary customer domain. If Froxlor contains `customer.example`, the definition above adds `dba.customer.example`.
 
-After placing the project in its final location, preview and install the scheduler configuration:
+`additional_domains` contains extra base domains, not complete service names. For example:
+
+```php
+'subdomains'         => ['mail'],
+'additional_domains' => ['external.example'],
+```
+
+adds `mail.external.example`. Supplying `mail.external.example` would incorrectly produce `mail.mail.external.example`.
+
+Duplicate names are removed while preserving order.
+
+## DNS validation
+
+Before calling acme.sh, the script retains only names whose public A or AAAA records match an address detected on the server. Create DNS records before enabling a new hostname or customer-domain service name.
+
+A failed name is excluded so valid names can still be processed, but it is also recorded as an operational error. The run therefore returns `1` and may send an error notification. Use `--skip-dns-validation` only for deliberate troubleshooting, never in the scheduled command.
+
+## Running one certificate
+
+Use `--certificate=TYPE` to inspect or run one definition:
+
+```sh
+/usr/bin/php /opt/AcmeSan/acme.php --dry-run --certificate=dba
+/usr/bin/php /opt/AcmeSan/acme.php --certificate=dba
+```
+
+When the requested SAN set differs from the stored certificate, acme.sh proceeds even if normal renewal is not yet due. `--force` is therefore unnecessary when adding or removing domains.
+
+Use a forced run only during a monitored service window when you deliberately need a new unchanged certificate:
+
+```sh
+/usr/bin/php /opt/AcmeSan/acme.php --force --certificate=dba
+```
+
+## Certificate output and service reloads
+
+Certificates default to `/etc/ssl/acme-sans/<type>/`:
+
+```text
+cert.pem
+key.pem
+fullchain.pem
+```
+
+After successful issuance, the directory is set to mode `0700` and the three PEM files to `0600`. The definition's post-command is then eligible to run. Identical post-commands are deduplicated and run once after all certificate attempts.
+
+A certificate definition does not schedule its post-command when its issuance is skipped or fails. Post-commands are trusted root-level shell commands and must never contain untrusted input.
+
+## Notifications
+
+The script sends error reports to Froxlor's configured `panel.adminmail` address using `Froxlor\System\Mailer`. Froxlor remains responsible for the sender, Reply-To address, SMTP settings, authentication, and encryption.
+
+Normal dry runs do not send mail. `--dry-run --test-email` sends one clearly labelled test message, while `--no-email` disables notifications for one run. Those two options cannot be combined.
+
+## Scheduling and logs
+
+Run the installer only after the project is in its final location. Preview it first:
 
 ```sh
 /usr/bin/php /opt/AcmeSan/acme.php --install --dry-run
 /usr/bin/php /opt/AcmeSan/acme.php --install
 ```
 
-The installer resolves the current `acme.php` path and prefers the stable `/usr/bin/php` launcher so the cron entry follows the system's configured PHP version. If that launcher is unavailable, it falls back to the currently running PHP CLI executable. It does not assume `/opt/AcmeSan`, copy project files, load Froxlor, or run certificate logic. Preview does not require root, while installation does. It creates or updates only files carrying its managed marker and refuses to overwrite unmanaged files.
+Preview does not require root; installation does. The installer uses the current `acme.php` location, prefers `/usr/bin/php`, and falls back to the active PHP CLI executable when necessary. It does not copy project files, load Froxlor, or run certificate logic.
 
-The generated `/etc/cron.d/acme-san` contains:
+It safely creates or updates only files bearing its managed marker and refuses symbolic links, unmanaged targets, or differently-cased duplicate filenames.
+
+The generated `/etc/cron.d/acme-san` is:
 
 ```cron
 # Managed by AcmeSan --install
@@ -125,20 +179,12 @@ PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 MAILTO=root
 
 # Daily ACME SAN certificate check
-17 3 * * * root /usr/bin/php /opt/AcmeSan/acme.php >> /var/log/acme-san.log 2>&1
+17 3 * * * root '/usr/bin/php' '/opt/AcmeSan/acme.php' >> /var/log/acme-san.log 2>&1
 ```
 
-Unlike a personal crontab, an `/etc/cron.d` entry requires the `root` user field between the schedule and command. Keep the filename lowercase and end the file with a newline. Set its ownership and mode, then confirm cron is running:
+Daily execution is intentional: unchanged certificates are skipped, while domain changes and transient failures are discovered promptly. Routine output and early PHP or Froxlor failures are redirected to the log. `MAILTO=root` remains a final fallback if the shell cannot establish that redirection.
 
-```sh
-chown root:root /etc/cron.d/acme-san
-chmod 0644 /etc/cron.d/acme-san
-systemctl is-active cron
-```
-
-The log redirection is not required for certificate generation. It is recommended because configuration, PHP, or database failures that occur before Froxlor's mailer is available can otherwise be lost. Without redirection, cron normally emails all stdout and stderr, including routine renewal-skip output.
-
-The installer also creates `/etc/logrotate.d/acme-san`:
+The generated `/etc/logrotate.d/acme-san` is:
 
 ```text
 # Managed by AcmeSan --install
@@ -153,28 +199,55 @@ The installer also creates `/etc/logrotate.d/acme-san`:
 }
 ```
 
-When upgrading from the old CLI, deploy the new script and replace `--config-path` with `--froxlor-config` in the cron entry as one controlled change. There is intentionally no compatibility alias.
+Verify the installation:
+
+```sh
+ls -l /etc/cron.d/acme-san /etc/logrotate.d/acme-san
+systemctl is-active cron
+logrotate --debug /etc/logrotate.d/acme-san
+```
+
+Both managed files should be owned by `root:root` with mode `0644`. A missing `/var/log/acme-san.log` is normal until the first redirected execution.
+
+## Timezone
+
+Before its first timestamped message, the script attempts to detect the operating-system timezone from `/etc/timezone`, the `/etc/localtime` zoneinfo link, then `timedatectl`. It applies only a timezone identifier recognized by PHP and otherwise retains PHP's configured timezone. Named zones preserve daylight-saving transitions correctly.
+
+## Options and exit statuses
+
+Run `php acme.php --help` for the authoritative option list.
+
+| Status | Meaning |
+| --- | --- |
+| `0` | Success, including normal renewal skips |
+| `1` | Operational failure, including DNS, ACME, post-command, or test-mail failure |
+| `2` | Invalid command-line option or local configuration |
+
+acme.sh's own status `2` means renewal is not currently required. The wrapper classifies that as a normal skip and exits with `0` unless another operational error occurred.
 
 ## Troubleshooting
 
-- **Configuration error:** run `php acme.php --help`, check that local files return arrays, and correct the exact unknown or invalid key shown.
-- **Froxlor/database error:** verify the `userdata.inc.php` path, permissions, credentials, PDO MySQL extension, and database availability.
-- **DNS exclusions:** compare public A and AAAA answers with the server addresses logged by the script.
-- **Lock error:** another non-dry-run instance may be active. Inspect the configured lock file and process; do not delete it while a process is running.
-- **ACME failure:** review the logged, shell-quoted command and acme.sh output, then verify the challenge webroot and CA configuration.
-- **Notification failure:** verify Froxlor's administrator address and mail settings, plus the readability of Froxlor's `vendor/autoload.php` and `lib/tables.inc.php`. Transport failures follow Froxlor's own mailer behavior; the script does not add a separate fallback.
-- **Permission failure:** verify the execution user can write the certificate and lock locations and run every configured post-command.
+- **Configuration error:** Check that the local file returns an array and correct the exact unknown or invalid field reported.
+- **Froxlor or database error:** Verify `userdata.inc.php`, its permissions, database credentials, and the PDO MySQL extension.
+- **DNS validation error:** Compare the public A and AAAA answers with the server addresses printed by the script.
+- **Lock error:** Another non-dry-run instance may be active. Inspect the configured lock file and process; never remove it while the process is running.
+- **ACME failure:** Review the logged, shell-quoted command and acme.sh output, then verify the challenge webroot and CA configuration.
+- **Notification failure:** Verify `panel.adminmail`, Froxlor's mail settings, and access to `vendor/autoload.php` and `lib/tables.inc.php`.
+- **Permission or reload failure:** Verify that the execution user can write the configured paths and run every post-command.
 
-## Deployment checklist
+## Updating from the old CLI
 
-1. Review `acme.local.php`, ownership, and mode.
-2. Run PHP syntax and coding-standard checks.
-3. Run `php acme.php --help`.
-4. Run `php acme.php --dry-run` using the production command and user.
-5. Review certificate types, SANs, paths, and post-commands in the output.
-6. Run one monitored, non-forced certificate cycle.
-7. Verify exit status, certificate SANs and permissions, services, notifications, and the next scheduled cron run.
+The former `--config-path` option is intentionally unsupported. Replace it with `--froxlor-config` at the same time as deploying the current script so an old scheduled command cannot silently use the wrong database configuration.
+
+## Security checklist
+
+- Keep `acme.local.php` out of Git and mode `0600`.
+- Run the script and scheduler as a trusted administrative account.
+- Review every post-command as root-level code.
+- Start with `--dry-run` after configuration changes.
+- Verify certificate SANs, PEM permissions, service state, exit status, and notifications after live issuance.
+- Keep each SAN set within the current limits of the configured certificate authority; the script does not split oversized certificates.
 
 ## License
 
-BSD 3-Clause. See [`LICENSE`](LICENSE).
+BSD 3-Clause. See [LICENSE](LICENSE).

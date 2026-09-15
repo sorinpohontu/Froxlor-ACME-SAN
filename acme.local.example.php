@@ -40,16 +40,28 @@ return [
     ],
 
     // Supplying certificates replaces the complete built-in certificate map.
+    // Enable include_hostname_subdomains only when <prefix>.<server-hostname>
+    // is a real service name for that certificate.
+    // additional_domains contains base domains; each configured subdomain
+    // prefix is prepended automatically.
     'certificates' => [
         'mail' => [
-            'subdomains' => ['mail'],
-            'additional_domains' => [],
-            'post_command' => 'systemctl restart postfix dovecot',
+            'subdomains'                  => ['mail'],
+            'include_hostname_subdomains' => false,
+            'additional_domains'          => [],
+            'post_command'                => 'systemctl restart postfix dovecot',
         ],
         'webmail' => [
-            'subdomains' => ['webmail'],
-            'additional_domains' => [],
-            'post_command' => 'systemctl restart apache2',
+            'subdomains'                  => ['webmail'],
+            'include_hostname_subdomains' => false,
+            'additional_domains'          => [],
+            'post_command'                => 'systemctl restart apache2',
+        ],
+        'dav' => [
+            'subdomains'                  => ['dav'],
+            'include_hostname_subdomains' => false,
+            'additional_domains'          => [],
+            'post_command'                => 'systemctl restart apache2',
         ],
     ],
 ];

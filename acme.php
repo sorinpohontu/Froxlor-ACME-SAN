@@ -1,41 +1,6 @@
 <?php
 /**
- * ACME.sh SAN Certificate Generator for Multiple Domains
- *
- * This script generates SAN (Subject Alternative Name) certificates using acme.sh
- * for multiple domains managed by Froxlor.
- * It supports automatic DNS validation, email notifications and post-generation commands.
- *
- * Features:
- * - Automatic domain discovery from Froxlor database
- * - DNS validation for domains before certificate generation
- * - Generate a single SAN certificate for each type of subdomain: mail, webmail, dav
- * - Optional local configuration without editing the script
- * - Error notifications using Froxlor's configured mail transport
- * - Post-generation commands for service reloads (executed only once per unique command)
- * - Dry-run mode for testing
- *
- * Requirements:
- * - PHP 7.4 or higher (matching Froxlor v2)
- * - PDO MySQL extension
- * - acme.sh installed at /root/.acme.sh
- * - Write access to certificate directory (/etc/ssl/acme-sans by default)
- * - Network access for DNS lookups and ACME challenges
- *
- * Usage:
- *   php acme.php --help
- *
- * Options:
- *   --froxlor-config=/path/to/config.php Custom path to Froxlor config
- *   --local-config=/path/to/config.php   Custom path to local script config
- *   --certificate=TYPE                   Process one configured certificate type
- *   --install                            Install cron and logrotate configuration
- *   --dry-run                            Test run without making changes
- *   --test-email                         Send a test email during a dry run
- *   --no-email                           Disable email notifications
- *   --skip-dns-validation                Skip DNS validation checks
- *   --force                              Force certificate generation even if existing
- *   --help                               Show usage information
+ * ACME.sh SAN certificate generator for Froxlor-managed domains.
  *
  * @package    Froxlor
  * @subpackage ACME-SAN
@@ -51,7 +16,6 @@
 
 namespace Frontline;
 
-// Import necessary classes
 use PDO;
 use PDOException;
 use Exception;
@@ -128,19 +92,22 @@ class AcmeSanCertificateGenerator
     /** @var array Subdomain and post-command configuration */
     private $_subdomainConfig = [
         'mail' => [
-            'subdomains'         => ['mail'],
-            'additional_domains' => [], // Additional base domains (subdomains will be prepended automatically)
-            'post_command'       => 'systemctl restart postfix dovecot',
+            'subdomains'                  => ['mail'],
+            'include_hostname_subdomains' => false,
+            'additional_domains'          => [],
+            'post_command'                => 'systemctl restart postfix dovecot',
         ],
         'webmail' => [
-            'subdomains'         => ['webmail'],
-            'additional_domains' => [], // Additional base domains (subdomains will be prepended automatically)
-            'post_command'       => 'systemctl restart apache2',
+            'subdomains'                  => ['webmail'],
+            'include_hostname_subdomains' => false,
+            'additional_domains'          => [],
+            'post_command'                => 'systemctl restart apache2',
         ],
         'dav' => [
-            'subdomains'         => ['dav'],
-            'additional_domains' => [], // Additional base domains (subdomains will be prepended automatically)
-            'post_command'       => 'systemctl restart apache2',
+            'subdomains'                  => ['dav'],
+            'include_hostname_subdomains' => false,
+            'additional_domains'          => [],
+            'post_command'                => 'systemctl restart apache2',
         ],
     ];
 
@@ -164,9 +131,6 @@ class AcmeSanCertificateGenerator
 
     /**
      * AcmeSanCertificateGenerator constructor.
-     *
-     * Initializes the generator, parses arguments, loads configuration,
-     * connects to the database, and detects server IPs.
      *
      * @param array $options Parsed command-line options
      *
@@ -211,11 +175,7 @@ class AcmeSanCertificateGenerator
     }
 
     /**
-     * Align PHP timestamps with the operating-system timezone when detectable.
-     *
-     * Debian's /etc/timezone is preferred, followed by the /etc/localtime
-     * zoneinfo link and timedatectl. PHP's configured timezone is retained
-     * when no valid system timezone identifier can be found.
+     * Align PHP timestamps with the detected operating-system timezone.
      *
      * @return void
      */
@@ -252,16 +212,12 @@ class AcmeSanCertificateGenerator
     /**
      * Validate and apply one operating-system timezone candidate.
      *
-     * @param mixed $candidate Candidate timezone identifier
+     * @param string $candidate Candidate timezone identifier
      *
      * @return boolean True when the candidate was applied
      */
-    private static function applyTimezoneCandidate($candidate): bool
+    private static function applyTimezoneCandidate(string $candidate): bool
     {
-        if (!is_string($candidate)) {
-            return false;
-        }
-
         $candidate = trim($candidate);
         $candidate = preg_replace('#^(?:posix|right)/#', '', $candidate);
         if (!is_string($candidate) || $candidate === '') {
@@ -278,17 +234,6 @@ class AcmeSanCertificateGenerator
 
     /**
      * Parse command-line arguments without causing runtime side effects.
-     *
-     * Supported arguments:
-     * --froxlor-config=/path/to/config.php
-     * --local-config=/path/to/config.php
-     * --certificate=TYPE
-     * --install
-     * --dry-run
-     * --test-email
-     * --no-email
-     * --skip-dns-validation
-     * --force
      *
      * @param array $arguments Arguments excluding the script name
      *
@@ -673,7 +618,11 @@ class AcmeSanCertificateGenerator
                 if (!is_array($certificate)) {
                     throw new InvalidArgumentException('certificates.' . $type . ' must be an array');
                 }
-                $this->assertAllowedKeys($certificate, ['subdomains', 'additional_domains', 'post_command'], 'certificates.' . $type);
+                $this->assertAllowedKeys(
+                    $certificate,
+                    ['subdomains', 'include_hostname_subdomains', 'additional_domains', 'post_command'],
+                    'certificates.' . $type
+                );
                 if (!isset($certificate['subdomains']) || !is_array($certificate['subdomains']) || empty($certificate['subdomains'])) {
                     throw new InvalidArgumentException('certificates.' . $type . '.subdomains must be a non-empty array');
                 }
@@ -681,6 +630,13 @@ class AcmeSanCertificateGenerator
                     if (!is_string($subdomain) || !$this->validateDnsLabel($subdomain)) {
                         throw new InvalidArgumentException('Invalid subdomain in certificates.' . $type . ': ' . (string) $subdomain);
                     }
+                }
+                if (array_key_exists('include_hostname_subdomains', $certificate)
+                    && !is_bool($certificate['include_hostname_subdomains'])
+                ) {
+                    throw new InvalidArgumentException(
+                        'certificates.' . $type . '.include_hostname_subdomains must be a boolean'
+                    );
                 }
                 if (isset($certificate['additional_domains'])) {
                     if (!is_array($certificate['additional_domains'])) {
@@ -777,9 +733,10 @@ class AcmeSanCertificateGenerator
             $certificates = [];
             foreach ($this->_localConfig['certificates'] as $type => $certificate) {
                 $certificates[$type] = [
-                    'subdomains'         => array_values($certificate['subdomains']),
-                    'additional_domains' => array_values($certificate['additional_domains'] ?? []),
-                    'post_command'       => $certificate['post_command'] ?? '',
+                    'subdomains'                  => array_values($certificate['subdomains']),
+                    'include_hostname_subdomains' => $certificate['include_hostname_subdomains'] ?? false,
+                    'additional_domains'          => array_values($certificate['additional_domains'] ?? []),
+                    'post_command'                => $certificate['post_command'] ?? '',
                 ];
             }
             $this->_subdomainConfig = $certificates;
@@ -928,14 +885,11 @@ class AcmeSanCertificateGenerator
      */
     private function getSetting($settinggroup, $varname = null)
     {
-        // Base query
         $sql = 'SELECT varname, value FROM panel_settings WHERE settinggroup = :group';
         $params = [':group' => $settinggroup];
 
-        // Handle optional varname
         if ($varname !== null) {
             if (is_array($varname)) {
-                // Array: use IN clause
                 $placeholders = [];
                 foreach ($varname as $i => $v) {
                     $key = ":var$i";
@@ -944,7 +898,6 @@ class AcmeSanCertificateGenerator
                 }
                 $sql .= ' AND varname IN (' . implode(',', $placeholders) . ')';
             } else {
-                // Single string
                 $sql .= ' AND varname = :var';
                 $params[':var'] = $varname;
             }
@@ -954,17 +907,14 @@ class AcmeSanCertificateGenerator
         $stmt->execute($params);
         $rows = $stmt->fetchAll(PDO::FETCH_KEY_PAIR); // returns [varname => value]
 
-        // All settings in group
         if ($varname === null) {
             return $rows;
         }
 
-        // Multiple requested keys
         if (is_array($varname)) {
             return $rows;
         }
 
-        // Single string requested
         return $rows[$varname] ?? null;
     }
 
@@ -977,21 +927,18 @@ class AcmeSanCertificateGenerator
     {
         $this->log('Detecting server IP addresses...');
 
-        // Get IPv4 addresses
         $ipv4Output = shell_exec("hostname -I 2>/dev/null || ip addr show | grep 'inet ' | grep -v '127.0.0.1' | awk '{print $2}' | cut -d'/' -f1");
         if ($ipv4Output) {
             $ipv4s = preg_split('/\s+/', trim($ipv4Output), -1, PREG_SPLIT_NO_EMPTY);
             $this->_serverIPs = array_merge($this->_serverIPs, $ipv4s);
         }
 
-        // Get IPv6 addresses (optional)
         $ipv6Output = shell_exec("ip -6 addr show | grep 'inet6' | grep -v '::1' | grep -v 'fe80:' | awk '{print $2}' | cut -d'/' -f1 2>/dev/null");
         if ($ipv6Output) {
             $ipv6s = preg_split('/\s+/', trim($ipv6Output), -1, PREG_SPLIT_NO_EMPTY);
             $this->_serverIPs = array_merge($this->_serverIPs, $ipv6s);
         }
 
-        // Remove duplicates and empty values
         $this->_serverIPs = array_values(array_unique(array_filter($this->_serverIPs)));
 
         if (empty($this->_serverIPs)) {
@@ -1144,7 +1091,6 @@ class AcmeSanCertificateGenerator
      */
     private function getDomains(): array
     {
-        // Get all active (deactivated = 0) primary domains (parentdomainid = 0)
         $stmt = $this->_pdo->prepare('SELECT D.domain
         FROM panel_domains D
         INNER JOIN panel_customers C ON C.customerid = D.customerid
@@ -1168,7 +1114,7 @@ class AcmeSanCertificateGenerator
     private function generateCertificates()
     {
         $domains = $this->getDomains();
-        $postCommands = []; // Collect unique post-commands to execute at the end
+        $postCommands = [];
 
         $this->log('Using hostname: ' . $this->_hostname);
         echo "\n"; // Add line spacing
@@ -1178,21 +1124,23 @@ class AcmeSanCertificateGenerator
 
             $sanDomains = [];
 
-            // Add main domain (hostname) as primary
             $sanDomains[] = $this->_hostname;
 
-            // Add subdomains for each domain
+            if ($config['include_hostname_subdomains']) {
+                foreach ($config['subdomains'] as $subdomain) {
+                    $sanDomains[] = "{$subdomain}.{$this->_hostname}";
+                }
+            }
+
             foreach ($domains as $domain) {
                 foreach ($config['subdomains'] as $subdomain) {
                     $sanDomains[] = "{$subdomain}.{$domain}";
                 }
             }
 
-            // Add additional domains if configured (not hosted on this server but pointing to it)
             if (!empty($config['additional_domains']) && is_array($config['additional_domains'])) {
                 foreach ($config['additional_domains'] as $additionalDomain) {
                     if (!empty($additionalDomain) && is_string($additionalDomain)) {
-                        // Add each subdomain prefix to the additional domain
                         foreach ($config['subdomains'] as $subdomain) {
                             $fullDomain = "{$subdomain}.{$additionalDomain}";
                             $sanDomains[] = $fullDomain;
@@ -1205,7 +1153,6 @@ class AcmeSanCertificateGenerator
             // Avoid duplicate validation and duplicate ACME -d arguments.
             $sanDomains = array_values(array_unique(array_map('strtolower', $sanDomains)));
 
-            // Validate DNS for all domains in this certificate
             $validatedDomains = $this->validateDNS($sanDomains);
 
             if (empty($validatedDomains)) {
@@ -1227,13 +1174,11 @@ class AcmeSanCertificateGenerator
             $certHome = rtrim($this->_certRoot, '/') . '/' . $certType;
             $certificateGenerated = $this->issueCertificate($certType, $validatedDomains, $certHome);
 
-            // Collect post-command for later execution (only if certificate was generated successfully)
             if ($certificateGenerated && !empty($config['post_command']) && !in_array($config['post_command'], $postCommands, true)) {
                 $postCommands[] = $config['post_command'];
             }
         }
 
-        // Execute all unique post-commands at the end
         $this->executePostCommands($postCommands);
     }
 
@@ -1248,7 +1193,6 @@ class AcmeSanCertificateGenerator
      */
     private function issueCertificate(string $certType, array $sanDomains, string $certHome): bool
     {
-        // Ensure cert_home directory exists
         if (!$this->_dryRun && !is_dir($certHome)) {
             if (!@mkdir($certHome, 0755, true)) {
                 $error = error_get_last();
@@ -1257,7 +1201,6 @@ class AcmeSanCertificateGenerator
             $this->log('Created certificate directory: ' . $certHome);
         }
 
-        // Build acme.sh command
         // https://github.com/acmesh-official/acme.sh/wiki/Options-and-Params
         $cmd = escapeshellarg($this->_acmeScriptPath) . ' --issue';
         if ($this->_force) {
@@ -1291,7 +1234,6 @@ class AcmeSanCertificateGenerator
         }
         $lastRequest = microtime(true);
 
-        // Execute acme.sh command
         $output = [];
         $returnCode = 0;
         exec($cmd . ' 2>&1', $output, $returnCode);
@@ -1304,7 +1246,6 @@ class AcmeSanCertificateGenerator
         );
 
         if ($certificateGenerated) {
-            // Set secure permissions on certificate files
             $certFiles = ['cert.pem', 'key.pem', 'fullchain.pem'];
             foreach ($certFiles as $file) {
                 $path = $certHome . '/' . $file;
@@ -1312,7 +1253,6 @@ class AcmeSanCertificateGenerator
                     chmod($path, 0600);
                 }
             }
-            // Set directory permissions
             chmod($certHome, 0700);
         }
 
@@ -1391,7 +1331,6 @@ class AcmeSanCertificateGenerator
                 $this->log('Post-command failed with return code: ' . $postReturnCode);
                 $this->log('Post-command output: ' . implode("\n", $postOutput));
 
-                // Add post-command error to collection
                 $this->_errors[] = [
                     'type'        => 'post_command',
                     'cert_type'   => 'final',
@@ -1460,11 +1399,16 @@ class AcmeSanCertificateGenerator
                 }
             }
 
+            if (!isset($config['include_hostname_subdomains'])
+                || !is_bool($config['include_hostname_subdomains'])
+            ) {
+                throw new Exception("Invalid include_hostname_subdomains for type: $type");
+            }
+
             if (isset($config['post_command']) && (!is_string($config['post_command']) || strpos($config['post_command'], "\0") !== false)) {
                 throw new Exception("Invalid post_command for type: $type");
             }
 
-            // Validate additional_domains if present
             if (isset($config['additional_domains'])) {
                 if (!is_array($config['additional_domains'])) {
                     throw new Exception("Invalid additional_domains for type: $type - must be an array");
@@ -1510,7 +1454,6 @@ class AcmeSanCertificateGenerator
             throw new Exception('Another instance is already running');
         }
 
-        // Write PID to lock file
         ftruncate($this->_lockHandle, 0);
         fwrite($this->_lockHandle, getmypid());
     }
@@ -1518,7 +1461,6 @@ class AcmeSanCertificateGenerator
     /**
      * Release process lock
      *
-     * This method releases the lock acquired by acquireLock().
      * @return void
      */
     private function releaseLock(): void
@@ -1691,7 +1633,6 @@ class AcmeSanCertificateGenerator
             $this->generateCertificates();
             $this->log('Certificate generation process completed');
 
-            // Send error notification if there were any errors
             $this->sendErrorNotification();
 
             if ($this->_testEmail) {
@@ -1704,7 +1645,6 @@ class AcmeSanCertificateGenerator
         } catch (Throwable $e) {
             $this->log('ERROR: ' . $e->getMessage());
 
-            // Add critical error to collection
             $this->_errors[] = [
                 'type'        => 'critical_error',
                 'cert_type'   => 'N/A',
@@ -1713,7 +1653,6 @@ class AcmeSanCertificateGenerator
                 'trace'       => $e->getTraceAsString()
             ];
 
-            // Send error notification
             $this->sendErrorNotification();
             $exitCode = 1;
         } finally {
@@ -1763,7 +1702,6 @@ class AcmeSanCertificateGenerator
      */
     private function validateDomainName(string $domain): bool
     {
-        // RFC 1034/1035 compliant domain validation
         return (
             preg_match('/^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/', $domain)
             && strlen($domain) <= 255
@@ -1804,9 +1742,7 @@ class AcmeSanCertificateGenerator
     }
 }
 
-// Only execute if this file is run directly (not included)
 if (basename(__FILE__) === basename($_SERVER['SCRIPT_FILENAME'])) {
-    // Check if running from command line
     if (php_sapi_name() !== 'cli') {
         echo "This script must be run from command line\n";
         exit(1);
