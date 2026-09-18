@@ -1,6 +1,7 @@
 # Froxlor ACME SAN
 
-Generate and renew service certificates for the active customer domains managed by Froxlor. The script creates one SAN certificate per service definition—for example `mail`, `webmail`, or `dav`—using Froxlor's [acme.sh](https://github.com/acmesh-official/acme.sh) configuration.
+Generate and renew service certificates for the active customer domains managed by [Froxlor](https://www.froxlor.org).
+The script creates one (or more) Subject Alternative Name (SAN) certificate per service definition—for example `mail`, `webmail`, or `dav`—using Froxlor's [acme.sh](https://github.com/acmesh-official/acme.sh) configuration.
 
 It provides:
 
@@ -17,7 +18,7 @@ It provides:
 - PHP 7.4 or newer with PDO MySQL and DNS support
 - Froxlor v2 with a readable `lib/userdata.inc.php`
 - Froxlor's `acme.sh` installation and HTTP challenge path
-- Root, or an equivalent trusted administrative account
+- `root`, or an equivalent trusted administrative account
 - Network access for DNS resolution and ACME challenges
 
 The execution account must be able to read Froxlor's configuration, write the certificate and lock paths, and run every configured post-command.
