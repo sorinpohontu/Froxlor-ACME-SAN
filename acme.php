@@ -8,10 +8,10 @@
  * @copyright  2026 Sorin Pohontu
  * @license    https://opensource.org/licenses/BSD-3-Clause
  *
- * @version    1.0.0
+ * @version    1.1.0
  * @link       https://github.com/sorinpohontu/Froxlor-ACME-SAN
  *
- * @since      2026.09.14
+ * @since      2026.10.02
  */
 
 namespace Frontline;
@@ -620,7 +620,7 @@ class AcmeSanCertificateGenerator
                 }
                 $this->assertAllowedKeys(
                     $certificate,
-                    ['subdomains', 'include_hostname_subdomains', 'additional_domains', 'post_command'],
+                    ['subdomains', 'include_hostname_subdomains', 'additional_domains', 'post_command', 'group'],
                     'certificates.' . $type
                 );
                 if (!isset($certificate['subdomains']) || !is_array($certificate['subdomains']) || empty($certificate['subdomains'])) {
@@ -650,6 +650,9 @@ class AcmeSanCertificateGenerator
                 }
                 if (isset($certificate['post_command']) && (!is_string($certificate['post_command']) || strpos($certificate['post_command'], "\0") !== false)) {
                     throw new InvalidArgumentException('certificates.' . $type . '.post_command must be a string without NUL bytes');
+                }
+                if (isset($certificate['group']) && !$this->validateGroupName($certificate['group'])) {
+                    throw new InvalidArgumentException('certificates.' . $type . '.group must be a valid group name');
                 }
             }
         }
@@ -737,6 +740,7 @@ class AcmeSanCertificateGenerator
                     'include_hostname_subdomains' => $certificate['include_hostname_subdomains'] ?? false,
                     'additional_domains'          => array_values($certificate['additional_domains'] ?? []),
                     'post_command'                => $certificate['post_command'] ?? '',
+                    'group'                       => $certificate['group'] ?? null,
                 ];
             }
             $this->_subdomainConfig = $certificates;
@@ -1219,6 +1223,12 @@ class AcmeSanCertificateGenerator
         $this->log('Command: ' . $cmd);
         $this->log('Certificate will be stored in: ' . $certHome);
 
+        $group = $this->_subdomainConfig[$certType]['group'] ?? null;
+        $this->log(
+            'Certificate permissions: '
+            . ($group === null ? 'root-only (0700/0600)' : 'group ' . $group . ' (0750/0640)')
+        );
+
         if ($this->_dryRun) {
             $this->log('DRY RUN: Would execute acme.sh command');
             echo "\n"; // Add line spacing
@@ -1245,20 +1255,66 @@ class AcmeSanCertificateGenerator
             $returnCode
         );
 
-        if ($certificateGenerated) {
-            $certFiles = ['cert.pem', 'key.pem', 'fullchain.pem'];
-            foreach ($certFiles as $file) {
-                $path = $certHome . '/' . $file;
-                if (file_exists($path)) {
-                    chmod($path, 0600);
-                }
-            }
-            chmod($certHome, 0700);
-        }
+        // Also enforced on renewal skips so a changed group setting applies immediately.
+        $this->applyCertificatePermissions($certType, $certHome, $this->_subdomainConfig[$certType]['group'] ?? null);
 
         echo "\n"; // Add spacing between certificate types
 
         return $certificateGenerated;
+    }
+
+    /**
+     * Apply ownership and mode to a certificate directory and its PEM files.
+     *
+     * Without a group, files are 0600 and the directory 0700. With a group,
+     * that group gets read access: files 0640 and the directory 0750.
+     *
+     * @param string      $certType Certificate type
+     * @param string      $certHome Certificate directory
+     * @param string|null $group    Optional group granted read access
+     *
+     * @return void
+     */
+    private function applyCertificatePermissions(string $certType, string $certHome, ?string $group): void
+    {
+        if (!is_dir($certHome)) {
+            return;
+        }
+
+        $fileMode = $group === null ? 0600 : 0640;
+        $dirMode = $group === null ? 0700 : 0750;
+        $failed = [];
+
+        $paths = [$certHome => $dirMode];
+        foreach (['cert.pem', 'key.pem', 'fullchain.pem'] as $file) {
+            $path = $certHome . '/' . $file;
+            if (file_exists($path)) {
+                $paths[$path] = $fileMode;
+            }
+        }
+
+        foreach ($paths as $path => $mode) {
+            // Change group before widening the mode so access is never granted to the previous group.
+            if ($group !== null && !@chgrp($path, $group)) {
+                $failed[] = 'chgrp ' . $group . ' ' . $path;
+                continue;
+            }
+            if (!@chmod($path, $mode)) {
+                $failed[] = sprintf('chmod %04o %s', $mode, $path);
+            }
+        }
+
+        if (empty($failed)) {
+            return;
+        }
+
+        $this->log('Failed to set certificate permissions for: ' . $certType);
+        $this->_errors[] = [
+            'type'        => 'certificate_permissions',
+            'cert_type'   => $certType,
+            'return_code' => 0,
+            'output'      => implode("\n", $failed),
+        ];
     }
 
     /**
@@ -1407,6 +1463,15 @@ class AcmeSanCertificateGenerator
 
             if (isset($config['post_command']) && (!is_string($config['post_command']) || strpos($config['post_command'], "\0") !== false)) {
                 throw new Exception("Invalid post_command for type: $type");
+            }
+
+            if (isset($config['group'])) {
+                if (!$this->validateGroupName($config['group'])) {
+                    throw new Exception("Invalid group for type: $type");
+                }
+                if (function_exists('posix_getgrnam') && posix_getgrnam($config['group']) === false) {
+                    throw new Exception("Group does not exist for type $type: {$config['group']}");
+                }
             }
 
             if (isset($config['additional_domains'])) {
@@ -1675,6 +1740,18 @@ class AcmeSanCertificateGenerator
             strlen($label) <= 63
             && preg_match('/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/', $label)
         );
+    }
+
+    /**
+     * Validate a POSIX group name.
+     *
+     * @param mixed $group Group name
+     *
+     * @return boolean True if valid, false otherwise
+     */
+    private function validateGroupName($group): bool
+    {
+        return is_string($group) && (bool) preg_match('/^[a-z_][a-z0-9_.-]{0,31}$/i', $group);
     }
 
     /**

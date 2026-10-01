@@ -44,6 +44,8 @@ return [
     // is a real service name for that certificate.
     // additional_domains contains base domains; each configured subdomain
     // prefix is prepended automatically.
+    // group is optional: when set, that existing group can read the
+    // certificate (directory 0750, PEM files 0640 instead of 0700/0600).
     'certificates' => [
         'mail' => [
             'subdomains'                  => ['mail'],
@@ -56,6 +58,7 @@ return [
             'include_hostname_subdomains' => false,
             'additional_domains'          => [],
             'post_command'                => 'systemctl restart apache2',
+            // 'group'                    => 'www-data',
         ],
         'dav' => [
             'subdomains'                  => ['dav'],
