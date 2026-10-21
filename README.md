@@ -10,6 +10,7 @@ What you get:
 - One certificate and one reload command per service
 - DNS checks (A and AAAA) before anything is sent to the certificate authority
 - Renewal when a certificate is due, or as soon as its domain list changes
+- No wasted requests on new servers: until you have customers, the panel certificate is reused
 - Error reports by email, through Froxlor's own mail settings
 - Dry runs and single-certificate runs, so you can look before you leap
 - Optional cron and logrotate setup
@@ -18,7 +19,7 @@ What you get:
 
 You'll need:
 
-- PHP 7.4 or newer, with PDO MySQL and DNS support
+- PHP 7.4 or newer, with PDO MySQL, OpenSSL, and DNS support
 - Froxlor v2, with a readable `lib/userdata.inc.php`
 - Froxlor's `acme.sh` installation and HTTP challenge path
 - `root`, or an equally trusted administrative account
@@ -85,7 +86,7 @@ The one exception is `froxlor_config`, which is needed to reach the database and
 [acme.local.example.php](acme.local.example.php) lists every supported setting. A few things to keep in mind:
 
 - Unknown settings and invalid values are rejected, so typos won't go unnoticed.
-- Single values replace the defaults. `acme` and `email` are merged key by key, and lists replace the defaults rather than adding to them.
+- Most settings simply replace the default. Inside `acme` and `email`, list only the keys you want to change. Lists, such as `subdomains`, replace the default list rather than adding to it.
 - **If you define `certificates`, you replace the whole built-in list.** Include every certificate you want to keep.
 
 ### Defining a certificate
@@ -116,6 +117,20 @@ webmail.customer.example        ← one for each active customer domain
 - **`group`** (optional) lets a non-root service read the certificate. See [Letting a service read its certificate](#letting-a-service-read-its-certificate).
 
 Duplicate names are removed automatically, and the original order is kept.
+
+### New servers reuse the panel certificate
+
+On a new server with no customers yet, each certificate would contain only the server hostname, which Froxlor's own panel certificate already covers. Requesting it again for every service would waste your Let's Encrypt quota, which allows at most five identical certificates per week.
+
+So in that case the script doesn't request anything. It copies the panel certificate into the service's directory instead and keeps the copy up to date on every run, reloading the service whenever it changes. Once you add a customer domain or an `additional_domains` entry, the script goes back to issuing a full SAN certificate on its own.
+
+**What you need to do:** in Froxlor, turn on *Enable Let's Encrypt for the froxlor vhost* (under *Froxlor VirtualHost settings*) and let Froxlor issue that certificate before the first run. Until it exists, the run reports an error and doesn't touch the service's certificate files.
+
+Good to know:
+
+- The panel certificate is checked before it's copied. If it has expired, doesn't cover the hostname, or its files don't belong together, nothing is copied and you get an error.
+- The certificate, key, and chain are always replaced together, so a failed update never leaves a mismatched set behind.
+- If customers return while an earlier SAN certificate is still valid, the script puts that certificate back instead of requesting a new one.
 
 ## DNS checks
 
@@ -154,7 +169,7 @@ fullchain.pem
 
 After every real run, including runs where renewal wasn't needed, the directory is set to `0700` and the files to `0600`, so only root can read them.
 
-When a certificate is issued or renewed, its `post_command` runs once all certificates have been processed. If several certificates share the same command, it runs only once. When a certificate is skipped or fails, its command isn't run.
+When a certificate's files change, because it was issued, renewed, or its panel copy was updated, its `post_command` runs once all certificates have been processed. If several certificates share the same command, it runs only once. When nothing changed or something failed, the command isn't run.
 
 Reload commands run as root in a shell, so never put untrusted input in them.
 
@@ -195,11 +210,12 @@ Once the project is in its final location, let the script set up its own cron jo
 /usr/bin/php /opt/AcmeSan/acme.php --install
 ```
 
-The preview works for any user. The install itself needs `root`.
+Good to know:
 
-The installer uses the current location of `acme.php` and prefers `/usr/bin/php`. It doesn't copy files, load Froxlor, or touch any certificates.
-
-It's careful about what it overwrites. It only updates files that carry its own "managed" marker, and refuses symbolic links, files it didn't create, and look-alike filenames that differ only in case.
+- The preview works for any user. The install itself needs `root`.
+- The cron job points at `acme.php` where it is now, so install from the final location. It uses `/usr/bin/php` when available.
+- The installer doesn't copy files, load Froxlor, or touch any certificates.
+- It only overwrites files it created itself. Anything else at those paths, including symbolic links and look-alike names that differ only in case, is left alone and reported.
 
 Here's the `/etc/cron.d/acme-san` it creates:
 
@@ -244,7 +260,9 @@ Both files should be owned by `root:root` with mode `0644`. Don't worry if `/var
 
 ## Timezone
 
-Log timestamps use the server's timezone. The script looks for it in `/etc/timezone`, then the `/etc/localtime` link, then `timedatectl`. It only applies a timezone that PHP recognises and otherwise keeps PHP's own setting. Named zones handle daylight saving time correctly.
+Log timestamps use the server's timezone, so they line up with your other logs, including across daylight saving changes. There's nothing to configure.
+
+If the times look wrong, check the server's timezone. The script reads it from `/etc/timezone`, then the `/etc/localtime` link, then `timedatectl`, and falls back to PHP's own setting when none of them names a timezone PHP recognises.
 
 ## Options and exit codes
 
@@ -253,10 +271,10 @@ Run `php acme.php --help` for the full list of options.
 | Exit code | Meaning |
 | --- | --- |
 | `0` | Success, including certificates that didn't need renewing |
-| `1` | Something failed: DNS, ACME, permissions, a reload command, or the test email |
+| `1` | Something failed: DNS, ACME, the panel certificate copy, permissions, a reload command, or the test email |
 | `2` | Invalid command-line option or local configuration |
 
-When acme.sh says renewal isn't needed (its own exit code `2`), the script treats that as a normal skip, not an error.
+In the log, a certificate that doesn't need renewing shows acme.sh return code `2`. That's acme.sh saying "not yet", not an error, and it doesn't make the run fail.
 
 ## Troubleshooting
 
@@ -266,6 +284,7 @@ When acme.sh says renewal isn't needed (its own exit code `2`), the script treat
 - **Lock error:** another run may still be in progress. Check the lock file and the process, and never delete the lock while the process is running.
 - **ACME failure:** the log shows the exact acme.sh command and its output. Check the challenge webroot and the CA setting.
 - **No email received:** check `panel.adminmail`, Froxlor's mail settings, and that `vendor/autoload.php` and `lib/tables.inc.php` are readable.
+- **Panel certificate not usable:** turn on *Enable Let's Encrypt for the froxlor vhost* in Froxlor, wait for Froxlor's cron to issue the certificate, and make sure it covers the name that `hostname -f` returns. See [New servers reuse the panel certificate](#new-servers-reuse-the-panel-certificate).
 - **Permission or reload failure:** make sure the account running the script can write the configured paths and run every reload command, and that any configured `group` exists.
 
 ## Security checklist

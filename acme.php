@@ -8,7 +8,7 @@
  * @copyright  2026 Sorin Pohontu
  * @license    https://opensource.org/licenses/BSD-3-Clause
  *
- * @version    1.1.0
+ * @version    1.2.0
  * @link       https://github.com/sorinpohontu/Froxlor-ACME-SAN
  *
  * @since      2026.10.02
@@ -1157,26 +1157,32 @@ class AcmeSanCertificateGenerator
             // Avoid duplicate validation and duplicate ACME -d arguments.
             $sanDomains = array_values(array_unique(array_map('strtolower', $sanDomains)));
 
-            $validatedDomains = $this->validateDNS($sanDomains);
-
-            if (empty($validatedDomains)) {
-                $this->log('No valid domains found for certificate type: ' . $certType . '. Skipping...');
-                $this->_errors[] = [
-                    'type'        => 'no_valid_domains',
-                    'cert_type'   => $certType,
-                    'return_code' => 0,
-                    'output'      => 'All domains failed DNS validation for certificate type: ' . $certType,
-                    'domains'     => $sanDomains
-                ];
-                continue;
-            }
-
-            if (count($validatedDomains) < count($sanDomains)) {
-                $this->log('Some domains failed validation. Proceeding with ' . count($validatedDomains) . ' valid domains.');
-            }
-
             $certHome = rtrim($this->_certRoot, '/') . '/' . $certType;
-            $certificateGenerated = $this->issueCertificate($certType, $validatedDomains, $certHome);
+
+            if ($sanDomains === [strtolower($this->_hostname)]) {
+                // A hostname-only certificate would duplicate the panel certificate.
+                $certificateGenerated = $this->copyPanelCertificate($certType, $certHome);
+            } else {
+                $validatedDomains = $this->validateDNS($sanDomains);
+
+                if (empty($validatedDomains)) {
+                    $this->log('No valid domains found for certificate type: ' . $certType . '. Skipping...');
+                    $this->_errors[] = [
+                        'type'        => 'no_valid_domains',
+                        'cert_type'   => $certType,
+                        'return_code' => 0,
+                        'output'      => 'All domains failed DNS validation for certificate type: ' . $certType,
+                        'domains'     => $sanDomains
+                    ];
+                    continue;
+                }
+
+                if (count($validatedDomains) < count($sanDomains)) {
+                    $this->log('Some domains failed validation. Proceeding with ' . count($validatedDomains) . ' valid domains.');
+                }
+
+                $certificateGenerated = $this->issueCertificate($certType, $validatedDomains, $certHome);
+            }
 
             if ($certificateGenerated && !empty($config['post_command']) && !in_array($config['post_command'], $postCommands, true)) {
                 $postCommands[] = $config['post_command'];
@@ -1255,12 +1261,370 @@ class AcmeSanCertificateGenerator
             $returnCode
         );
 
+        // A skip only means acme.sh's stored certificate is current. The installed
+        // files may still be a hostname-only panel copy, or an incomplete set.
+        if ($returnCode === self::ACME_RENEWAL_SKIPPED) {
+            $problem = $this->checkCertificateSet($this->readCertificateFiles($certHome), $sanDomains, 'installed certificate');
+            if ($problem !== null) {
+                $this->log($problem);
+                $certificateGenerated = $this->restoreAcmeCertificate($certType, $sanDomains, $certHome);
+            }
+        }
+
         // Also enforced on renewal skips so a changed group setting applies immediately.
         $this->applyCertificatePermissions($certType, $certHome, $this->_subdomainConfig[$certType]['group'] ?? null);
 
         echo "\n"; // Add spacing between certificate types
 
         return $certificateGenerated;
+    }
+
+    /**
+     * Read a certificate set, using an empty string for each missing file.
+     *
+     * @param string $directory Directory holding the files
+     * @param array  $names     Source file name keyed by target file name
+     *
+     * @return array PEM content keyed by target file name
+     */
+    private function readCertificateFiles(string $directory, array $names = []): array
+    {
+        $files = [];
+        foreach (['cert.pem', 'key.pem', 'fullchain.pem'] as $file) {
+            $content = @file_get_contents($directory . '/' . ($names[$file] ?? $file));
+            $files[$file] = is_string($content) ? $content : '';
+        }
+
+        return $files;
+    }
+
+    /**
+     * Reinstall acme.sh's stored certificate over files that no longer match it.
+     *
+     * The stored set is read from acme.sh's state directory and validated before
+     * the installed files are replaced together, so a failure keeps the old set.
+     *
+     * @param string $certType   Certificate type
+     * @param array  $sanDomains Requested certificate names
+     * @param string $certHome   Certificate directory
+     *
+     * @return boolean True when the stored certificate was reinstalled
+     */
+    private function restoreAcmeCertificate(string $certType, array $sanDomains, string $certHome): bool
+    {
+        $this->log('Reinstalling the certificate acme.sh holds for: ' . $certType);
+
+        // acme.sh keeps ECC certificates in a separate <domain>_ecc directory.
+        $mainDomain = $sanDomains[0];
+        $stateDirectories = [$certHome . '/' . $mainDomain . '_ecc', $certHome . '/' . $mainDomain];
+        if (strpos((string) $this->_acmeKeyLength, 'ec-') !== 0) {
+            $stateDirectories = array_reverse($stateDirectories);
+        }
+
+        $problems = [];
+        foreach ($stateDirectories as $stateDirectory) {
+            if (!is_dir($stateDirectory)) {
+                continue;
+            }
+
+            $files = $this->readCertificateFiles($stateDirectory, [
+                'cert.pem'      => $mainDomain . '.cer',
+                'key.pem'       => $mainDomain . '.key',
+                'fullchain.pem' => 'fullchain.cer',
+            ]);
+            $problem = $this->checkCertificateSet($files, $sanDomains, 'stored certificate in ' . $stateDirectory);
+            if ($problem !== null) {
+                $problems[] = $problem;
+                continue;
+            }
+
+            if (!$this->writeCertificateFiles($certType, $certHome, $files)) {
+                return false;
+            }
+            $this->log('Certificate reinstalled from: ' . $stateDirectory);
+            return true;
+        }
+
+        $this->log('Certificate reinstall failed for: ' . $certType);
+        $this->_errors[] = [
+            'type'        => 'certificate_generation',
+            'cert_type'   => $certType,
+            'return_code' => self::ACME_RENEWAL_SKIPPED,
+            'output'      => "acme.sh skipped renewal, but the installed certificate doesn't match the requested names and no usable stored certificate was found. Run with --force --certificate={$certType}.\n"
+                . (empty($problems) ? 'No acme.sh state directory found for ' . $mainDomain : implode("\n", $problems)),
+            'domains'     => $sanDomains,
+        ];
+
+        return false;
+    }
+
+    /**
+     * Collect the lower-case DNS names of a parsed certificate.
+     *
+     * @param array $certificate Result of openssl_x509_parse()
+     *
+     * @return array Certificate names
+     */
+    private function getCertificateNames(array $certificate): array
+    {
+        $names = [];
+        $subject = (array) ($certificate['subject'] ?? []);
+        if (isset($subject['CN']) && is_string($subject['CN'])) {
+            $names[] = strtolower($subject['CN']);
+        }
+        foreach (explode(',', (string) ($certificate['extensions']['subjectAltName'] ?? '')) as $entry) {
+            $entry = trim($entry);
+            if (stripos($entry, 'DNS:') === 0) {
+                $names[] = strtolower(substr($entry, 4));
+            }
+        }
+
+        return array_values(array_unique($names));
+    }
+
+    /**
+     * Copy the panel certificate for a type whose only name is the hostname.
+     *
+     * Issuing the hostname again would spend a certificate on a duplicate of the
+     * panel's own. The copy is refreshed on every run, so it follows the panel's
+     * renewals.
+     *
+     * @param string $certType Certificate type
+     * @param string $certHome Directory to store certificates
+     *
+     * @return boolean True when the copied files changed
+     * @throws Exception If the certificate directory cannot be created
+     */
+    private function copyPanelCertificate(string $certType, string $certHome): bool
+    {
+        $this->log('Only the hostname is configured for: ' . $certType . '. Using the panel certificate');
+
+        $stmt = $this->_pdo->prepare('SELECT ssl_cert_file, ssl_key_file, ssl_fullchain_file
+        FROM domain_ssl_settings
+        WHERE domainid = 0');
+        $stmt->execute();
+        $row = $stmt->fetch() ?: [];
+
+        $files = [
+            'cert.pem'      => (string) ($row['ssl_cert_file'] ?? ''),
+            'key.pem'       => (string) ($row['ssl_key_file'] ?? ''),
+            'fullchain.pem' => (string) ($row['ssl_fullchain_file'] ?? ''),
+        ];
+
+        $problem = $this->checkPanelCertificate($files);
+        if ($problem !== null) {
+            $this->log('Panel certificate not usable for: ' . $certType . ' - ' . $problem);
+            $this->_errors[] = [
+                'type'        => 'panel_certificate',
+                'cert_type'   => $certType,
+                'return_code' => 0,
+                'output'      => $problem,
+            ];
+            echo "\n"; // Add spacing between certificate types
+            return false;
+        }
+
+        $changed = [];
+        foreach ($files as $file => $content) {
+            if (@file_get_contents($certHome . '/' . $file) !== $content) {
+                $changed[$file] = $content;
+            }
+        }
+
+        if ($this->_dryRun) {
+            if (empty($changed)) {
+                $this->log('DRY RUN: Panel certificate copy is current in: ' . $certHome);
+            } else {
+                $this->log('DRY RUN: Would copy panel certificate to: ' . $certHome);
+            }
+            echo "\n"; // Add spacing between certificate types
+            return !empty($changed);
+        }
+
+        if (!is_dir($certHome)) {
+            if (!@mkdir($certHome, 0700, true)) {
+                $error = error_get_last();
+                throw new Exception('Failed to create certificate directory: ' . $certHome . ' - ' . ($error['message'] ?? 'Unknown error'));
+            }
+            $this->log('Created certificate directory: ' . $certHome);
+        }
+
+        $copied = empty($changed) || $this->writeCertificateFiles($certType, $certHome, $changed);
+        if (empty($changed)) {
+            $this->log('Panel certificate copy is current for: ' . $certType);
+        } elseif ($copied) {
+            $this->log('Panel certificate copied to: ' . $certHome);
+        }
+
+        $this->applyCertificatePermissions($certType, $certHome, $this->_subdomainConfig[$certType]['group'] ?? null);
+
+        echo "\n"; // Add spacing between certificate types
+
+        return $copied && !empty($changed);
+    }
+
+    /**
+     * Check that the panel certificate exists, is current and covers the hostname.
+     *
+     * @param array $files PEM content keyed by target file name
+     *
+     * @return string|null Reason the certificate can't be used, or null when it can
+     */
+    private function checkPanelCertificate(array $files): ?string
+    {
+        if (in_array('', array_map('trim', $files), true)) {
+            return 'Froxlor has no panel certificate yet. Enable Let\'s Encrypt for the Froxlor vhost and wait for its cron to issue it';
+        }
+
+        return $this->checkCertificateSet($files, [$this->_hostname], 'panel certificate');
+    }
+
+    /**
+     * Check that a certificate, key and full chain form one current, usable set.
+     *
+     * @param array  $files PEM content keyed by target file name
+     * @param array  $names Names the certificate must cover
+     * @param string $label Description used in messages
+     *
+     * @return string|null Reason the set can't be used, or null when it can
+     */
+    private function checkCertificateSet(array $files, array $names, string $label): ?string
+    {
+        foreach ($files as $file => $content) {
+            if (trim($content) === '') {
+                return 'The ' . $label . ' has no ' . $file;
+            }
+        }
+        if (!function_exists('openssl_x509_parse')) {
+            return 'The PHP OpenSSL extension is required to check the ' . $label;
+        }
+
+        $certificate = openssl_x509_parse($files['cert.pem']);
+        if (!is_array($certificate)) {
+            return 'The ' . $label . ' could not be parsed';
+        }
+        if (($certificate['validTo_time_t'] ?? 0) <= time()) {
+            return 'The ' . $label . ' expired on ' . date('Y-m-d H:i:s', (int) ($certificate['validTo_time_t'] ?? 0));
+        }
+
+        $covered = $this->getCertificateNames($certificate);
+        $missing = array_diff(array_map('strtolower', $names), $covered);
+        if (!empty($missing)) {
+            return 'The ' . $label . ' does not cover ' . implode(', ', $missing) . ' (names: ' . implode(', ', $covered) . ')';
+        }
+
+        if (!openssl_x509_check_private_key($files['cert.pem'], $files['key.pem'])) {
+            return 'The ' . $label . ' and its key do not match';
+        }
+
+        // The full chain must be certificates only, starting with cert.pem itself.
+        $pattern = '/-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----/s';
+        if (!preg_match_all($pattern, $files['fullchain.pem'], $matches)
+            || trim(preg_replace($pattern, '', $files['fullchain.pem'])) !== ''
+        ) {
+            return 'The ' . $label . ' full chain is not a list of PEM certificates';
+        }
+        foreach ($matches[0] as $pem) {
+            if (openssl_x509_read($pem) === false) {
+                return 'The ' . $label . ' full chain contains a certificate that could not be parsed';
+            }
+        }
+        if (openssl_x509_fingerprint($matches[0][0], 'sha256') !== openssl_x509_fingerprint($files['cert.pem'], 'sha256')) {
+            return 'The ' . $label . ' full chain does not start with its certificate';
+        }
+
+        return null;
+    }
+
+    /**
+     * Replace certificate files as one set.
+     *
+     * All temporary files and backups are prepared before any file is moved into
+     * place. If a replacement fails, the files already replaced are rolled back,
+     * so the certificate, key and chain never come from different sets.
+     *
+     * @param string $certType Certificate type
+     * @param string $certHome Certificate directory
+     * @param array  $files    PEM content keyed by file name
+     *
+     * @return boolean True when every file was replaced
+     */
+    private function writeCertificateFiles(string $certType, string $certHome, array $files): bool
+    {
+        $temporaryPaths = [];
+        $backupPaths = [];
+        $replaced = [];
+        $failed = [];
+
+        try {
+            foreach ($files as $file => $content) {
+                $target = $certHome . '/' . $file;
+
+                // tempnam() creates the file with mode 0600, so the key is never exposed.
+                $temporaryPath = @tempnam($certHome, '.acme-san-');
+                if ($temporaryPath === false) {
+                    $failed[] = 'write ' . $target;
+                    break;
+                }
+                $temporaryPaths[$file] = $temporaryPath;
+                if (@file_put_contents($temporaryPath, $content, LOCK_EX) === false) {
+                    $failed[] = 'write ' . $target;
+                    break;
+                }
+
+                // A hard link keeps the previous file, with its mode, for rollback.
+                if (file_exists($target)) {
+                    $backupPath = $certHome . '/.acme-san-backup-' . bin2hex(random_bytes(8));
+                    if (!@link($target, $backupPath)) {
+                        $failed[] = 'back up ' . $target;
+                        break;
+                    }
+                    $backupPaths[$file] = $backupPath;
+                }
+            }
+
+            if (empty($failed)) {
+                foreach ($temporaryPaths as $file => $temporaryPath) {
+                    if (!@rename($temporaryPath, $certHome . '/' . $file)) {
+                        $failed[] = 'rename ' . $temporaryPath . ' ' . $certHome . '/' . $file;
+                        break;
+                    }
+                    $replaced[] = $file;
+                }
+            }
+
+            if (!empty($failed)) {
+                foreach ($replaced as $file) {
+                    $target = $certHome . '/' . $file;
+                    $restored = isset($backupPaths[$file]) ? @rename($backupPaths[$file], $target) : @unlink($target);
+                    if (!$restored) {
+                        // Keep the previous file for manual recovery.
+                        $failed[] = 'roll back ' . $target . (isset($backupPaths[$file]) ? ' (previous file kept as ' . $backupPaths[$file] . ')' : '');
+                        unset($backupPaths[$file]);
+                    }
+                }
+            }
+        } finally {
+            foreach (array_merge(array_values($temporaryPaths), array_values($backupPaths)) as $path) {
+                if (file_exists($path)) {
+                    @unlink($path);
+                }
+            }
+        }
+
+        if (empty($failed)) {
+            return true;
+        }
+
+        $this->log('Failed to replace certificate files for: ' . $certType . '. The previous files were kept');
+        $this->_errors[] = [
+            'type'        => 'certificate_files',
+            'cert_type'   => $certType,
+            'return_code' => 0,
+            'output'      => implode("\n", $failed),
+        ];
+
+        return false;
     }
 
     /**
