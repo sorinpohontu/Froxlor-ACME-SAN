@@ -8,10 +8,10 @@
  * @copyright  2026 Sorin Pohontu
  * @license    https://opensource.org/licenses/BSD-3-Clause
  *
- * @version    1.2.1
+ * @version    1.2.2
  * @link       https://github.com/sorinpohontu/Froxlor-ACME-SAN
  *
- * @since      2026.10.02
+ * @since      2026.11.09
  */
 
 namespace Frontline;
@@ -128,6 +128,9 @@ class AcmeSanCertificateGenerator
 
     /** @var array DNS validation results cached for this execution */
     private $_dnsValidationCache = [];
+
+    /** @var boolean|null Whether dig can be run; null until the first DNS check */
+    private $_digAvailable = null;
 
     /**
      * AcmeSanCertificateGenerator constructor.
@@ -1003,7 +1006,156 @@ class AcmeSanCertificateGenerator
     }
 
     /**
-     * Check if domain resolves to server IP
+     * Whether dig can be run, checked once per execution; without it the DNS checks use the system resolver
+     *
+     * @return boolean True when dig is on the PATH
+     */
+    private function digAvailable(): bool
+    {
+        if ($this->_digAvailable === null) {
+            exec('command -v dig 2>/dev/null', $output, $returnCode);
+            $this->_digAvailable = $returnCode === 0;
+            if (!$this->_digAvailable) {
+                $this->log('WARNING: dig not found (Debian: bind9-dnsutils); DNS checks use the system resolver and its cache');
+            }
+        }
+
+        return $this->_digAvailable;
+    }
+
+    /**
+     * Answer records of a dig query, without the comment and section lines
+     *
+     * @param array $args Dig arguments after the common options (server, flags, name, type)
+     *
+     * @return array|null [owner, type, data] per record (owner without the final dot, lower case); null when no server answered
+     */
+    private function digRecords(array $args): ?array
+    {
+        $cmd = 'dig +time=3 +tries=1 +noall +answer ' . implode(' ', array_map('escapeshellarg', $args)) . ' 2>/dev/null';
+        exec($cmd, $output, $returnCode);
+        if ($returnCode !== 0) {
+            return null;
+        }
+
+        $records = [];
+        foreach ($output as $line) {
+            $fields = preg_split('/\s+/', trim($line));
+            if (count($fields) >= 5) {
+                $records[] = [strtolower(rtrim($fields[0], '.')), strtoupper($fields[3]), rtrim(implode(' ', array_slice($fields, 4)), '.')];
+            }
+        }
+
+        return $records;
+    }
+
+    /**
+     * Nameservers of the zone holding a name: the NS set of the name or its closest parent, through the system resolver
+     *
+     * @param string $name Fully qualified name
+     *
+     * @return array Nameserver host names; empty when none was found
+     */
+    private function zoneNameservers(string $name): array
+    {
+        $labels = explode('.', strtolower(rtrim($name, '.')));
+        while (count($labels) > 1) {
+            $candidate = implode('.', $labels);
+            $nameservers = [];
+            foreach ($this->digRecords([$candidate, 'NS']) ?? [] as [$owner, $type, $data]) {
+                if ($type === 'NS' && $owner === $candidate) {
+                    $nameservers[] = $data;
+                }
+            }
+            if ($nameservers) {
+                return $nameservers;
+            }
+            array_shift($labels);
+        }
+
+        return [];
+    }
+
+    /**
+     * A and AAAA addresses of a name as its zone's own nameservers serve them, following CNAMEs into other zones
+     *
+     * @param string  $name  Fully qualified name
+     * @param integer $depth CNAME hops already followed
+     *
+     * @return array|null Addresses (empty when the name has none); null when no nameserver of a zone on the way answered
+     */
+    private function authoritativeAddresses(string $name, int $depth = 0): ?array
+    {
+        $name = strtolower(rtrim($name, '.'));
+        if ($depth > 8) {
+            return [];
+        }
+
+        foreach ($this->zoneNameservers($name) as $nameserver) {
+            $records = [];
+            foreach (['A', 'AAAA'] as $rtype) {
+                $answer = $this->digRecords(['@' . $nameserver, '+norecurse', $name, $rtype]);
+                if ($answer === null) {
+                    continue 2;
+                }
+                $records = array_merge($records, $answer);
+            }
+
+            // Follow the CNAME chain inside this answer; a target outside it is asked of its own zone
+            $current = $name;
+            for ($hop = 0; $hop <= 8; $hop++) {
+                $target = null;
+                foreach ($records as [$owner, $type, $data]) {
+                    if ($owner === $current && $type === 'CNAME') {
+                        $target = strtolower($data);
+                    }
+                }
+                if ($target === null) {
+                    break;
+                }
+                $current = $target;
+            }
+
+            $addresses = [];
+            foreach ($records as [$owner, $type, $data]) {
+                if ($owner === $current && ($type === 'A' || $type === 'AAAA')) {
+                    $addresses[] = $data;
+                }
+            }
+            if (!$addresses && $current !== $name) {
+                return $this->authoritativeAddresses($current, $depth + 1);
+            }
+
+            return $addresses;
+        }
+
+        return null;
+    }
+
+    /**
+     * A and AAAA addresses of a name through the system resolver
+     *
+     * @param string $name Fully qualified name
+     *
+     * @return array Addresses; empty when none resolved
+     */
+    private function resolverAddresses(string $name): array
+    {
+        $addresses = [];
+        foreach ([[DNS_A, 'ip'], [DNS_AAAA, 'ipv6']] as [$rtype, $field]) {
+            foreach (@dns_get_record($name, $rtype) ?: [] as $record) {
+                if (isset($record[$field])) {
+                    $addresses[] = $record[$field];
+                }
+            }
+        }
+
+        return $addresses;
+    }
+
+    /**
+     * Check if domain resolves to server IP: asked of the domain's own nameservers, so no resolver cache can
+     * hold an old answer; the system resolver only when none of them answers
      *
      * @param string $domain Domain to check
      *
@@ -1016,72 +1168,30 @@ class AcmeSanCertificateGenerator
             return $this->_dnsValidationCache[$cacheKey];
         }
 
-        $resolved = false;
-        $lastError = null;
-
-        // Retry DNS lookups to handle transient failures
-        for ($attempt = 1; $attempt <= $this->_dnsRetries; $attempt++) {
-            try {
-                // Check A record (IPv4)
-                $aRecords = @dns_get_record($domain, DNS_A);
-                if ($aRecords !== false && is_array($aRecords)) {
-                    foreach ($aRecords as $record) {
-                        if (isset($record['ip']) && in_array($record['ip'], $this->_serverIPs, true)) {
-                            $resolved = true;
-                            break 2; // Break out of both foreach and for loop
-                        }
-                    }
-                }
-
-                // Check AAAA record (IPv6) if not resolved yet
-                if (!$resolved) {
-                    $aaaaRecords = @dns_get_record($domain, DNS_AAAA);
-                    if ($aaaaRecords !== false && is_array($aaaaRecords)) {
-                        foreach ($aaaaRecords as $record) {
-                            if (isset($record['ipv6']) && in_array($record['ipv6'], $this->_serverIPs, true)) {
-                                $resolved = true;
-                                break 2; // Break out of both foreach and for loop
-                            }
-                        }
-                    }
-                }
-
-                // Alternative method using nslookup if dns_get_record fails
-                if (!$resolved && (empty($aRecords) && empty($aaaaRecords))) {
-                    $nslookupOutput = shell_exec('nslookup ' . escapeshellarg($domain) . " 2>/dev/null | grep 'Address:' | grep -v '#' | awk '{print $2}'");
-                    if ($nslookupOutput) {
-                        $resolvedIPs = array_filter(array_map('trim', explode("\n", trim($nslookupOutput))));
-                        foreach ($resolvedIPs as $ip) {
-                            if (in_array($ip, $this->_serverIPs, true)) {
-                                $resolved = true;
-                                break 2; // Break out of both foreach and for loop
-                            }
-                        }
-                    }
-                }
-
-                // If we got valid DNS records (even if they don't point to this server), stop retrying
-                if (($aRecords !== false && !empty($aRecords)) || ($aaaaRecords !== false && !empty($aaaaRecords))) {
-                    break;
-                }
-
-                // If no records found and not the last attempt, wait before retrying
-                if ($attempt < $this->_dnsRetries) {
-                    $lastError = "DNS lookup attempt $attempt failed for domain: $domain";
-                    sleep($this->_dnsRetryDelay);
-                }
-            } catch (Exception $e) {
-                $lastError = "DNS lookup exception on attempt $attempt for $domain: " . $e->getMessage();
-                if ($attempt < $this->_dnsRetries) {
-                    sleep($this->_dnsRetryDelay);
-                }
+        // Retry to ride out a nameserver that does not answer for a moment
+        $addresses = null;
+        for ($attempt = 1; $this->digAvailable() && $attempt <= $this->_dnsRetries; $attempt++) {
+            $addresses = $this->authoritativeAddresses($domain);
+            if ($addresses !== null) {
+                break;
+            }
+            if ($attempt < $this->_dnsRetries) {
+                sleep($this->_dnsRetryDelay);
             }
         }
-
-        // Log if we had to retry
-        if ($lastError && $resolved) {
-            $this->log("DNS lookup succeeded after retries for: $domain");
+        if ($addresses === null) {
+            if ($this->digAvailable()) {
+                $this->log("WARNING: No nameserver of $domain answered; checking it through the system resolver");
+            }
+            $addresses = $this->resolverAddresses($domain);
         }
+
+        // Compare in canonical form: the same IPv6 address can be written several ways
+        $canonical = function (string $address): string {
+            $packed = @inet_pton($address);
+            return $packed === false ? strtolower($address) : inet_ntop($packed);
+        };
+        $resolved = (bool) array_intersect(array_map($canonical, $addresses), array_map($canonical, $this->_serverIPs));
 
         $this->_dnsValidationCache[$cacheKey] = $resolved;
 

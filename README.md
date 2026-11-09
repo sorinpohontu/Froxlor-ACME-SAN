@@ -20,6 +20,7 @@ What you get:
 You'll need:
 
 - PHP 7.4 or newer, with PDO MySQL, OpenSSL, and DNS support
+- `dig` (Debian: `bind9-dnsutils`), for the DNS checks; without it they fall back to the system resolver, with a warning
 - Froxlor v2, with a readable `lib/userdata.inc.php`
 - Froxlor's `acme.sh` installation and HTTP challenge path
 - `root`, or an equally trusted administrative account
@@ -135,6 +136,8 @@ Good to know:
 ## DNS checks
 
 Before contacting the certificate authority, the script checks that each name's public A or AAAA record points at this server. That way a single missing DNS record can't make the whole certificate fail.
+
+The check asks the domain's own nameservers, not the server's resolver. It finds the zone's NS records, then queries those servers directly (`dig +norecurse`) for the name's A and AAAA records, following a CNAME into another zone the same way. No resolver cache sits in between, so a record you have just added or fixed counts on the next run, even if the local resolver still remembers the old answer or a "no such name". Only when none of the zone's nameservers answers does the script fall back to the system resolver, and it says so in the log.
 
 Names that don't pass are left out so the rest can still be issued. They're still reported as errors, though, so the run exits with `1` and you'll get an email. Set up the DNS records before you add a new service name or customer domain.
 
@@ -282,7 +285,7 @@ In the log, a certificate that doesn't need renewing shows acme.sh return code `
 
 - **Configuration error:** make sure the local file returns an array, then fix the setting named in the message.
 - **Froxlor or database error:** check `userdata.inc.php`, its permissions, the database credentials, and that the PDO MySQL extension is installed.
-- **DNS check failed:** compare the domain's public `A` and `AAAA` records with the server addresses shown in the output.
+- **DNS check failed:** compare the domain's `A` and `AAAA` records, as its own nameservers serve them (`dig +norecurse @NS NAME A`), with the server addresses shown in the output.
 - **Lock error:** another run may still be in progress. Check the lock file and the process, and never delete the lock while the process is running.
 - **ACME failure:** the log shows the exact acme.sh command and its output. Check the challenge webroot and the CA setting.
 - **No email received:** check `panel.adminmail`, Froxlor's mail settings, and that `vendor/autoload.php` and `lib/tables.inc.php` are readable.
