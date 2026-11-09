@@ -151,6 +151,8 @@ Use `--certificate=TYPE` to look at or run a single definition:
 
 You don't need `--force` when you add or remove domains. acme.sh notices that the domain list changed and issues a new certificate on its own.
 
+If an earlier attempt for a new domain list failed, acme.sh still records the list as current and would skip renewal until the old certificate is due. The script detects this case, where the certificate acme.sh holds doesn't cover the requested names, and forces a reissue once per run.
+
 Use `--force` only when you really do want a fresh copy of an unchanged certificate, and preferably during a maintenance window:
 
 ```sh

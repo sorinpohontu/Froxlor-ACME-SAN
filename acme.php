@@ -8,7 +8,7 @@
  * @copyright  2026 Sorin Pohontu
  * @license    https://opensource.org/licenses/BSD-3-Clause
  *
- * @version    1.2.0
+ * @version    1.2.1
  * @link       https://github.com/sorinpohontu/Froxlor-ACME-SAN
  *
  * @since      2026.10.02
@@ -1099,6 +1099,7 @@ class AcmeSanCertificateGenerator
         FROM panel_domains D
         INNER JOIN panel_customers C ON C.customerid = D.customerid
         WHERE D.parentdomainid = 0
+            AND D.deactivated = 0
             AND C.deactivated = 0
         ORDER BY 1');
 
@@ -1211,19 +1212,7 @@ class AcmeSanCertificateGenerator
             $this->log('Created certificate directory: ' . $certHome);
         }
 
-        // https://github.com/acmesh-official/acme.sh/wiki/Options-and-Params
-        $cmd = escapeshellarg($this->_acmeScriptPath) . ' --issue';
-        if ($this->_force) {
-            $cmd .= ' --force';
-        }
-        $cmd .= ' --server ' . escapeshellarg($this->_acmeCA);
-        $cmd .= ' --keylength ' . escapeshellarg((string) $this->_acmeKeyLength);
-        $cmd .= ' -d ' . implode(' -d ', array_map('escapeshellarg', $sanDomains));
-        $cmd .= ' -w ' . escapeshellarg($this->_acmeWebRoot);
-        $cmd .= ' --cert-home ' . escapeshellarg($certHome);
-        $cmd .= ' --cert-file ' . escapeshellarg($certHome . '/cert.pem');
-        $cmd .= ' --key-file ' . escapeshellarg($certHome . '/key.pem');
-        $cmd .= ' --fullchain-file ' . escapeshellarg($certHome . '/fullchain.pem');
+        $cmd = $this->buildAcmeCommand($sanDomains, $certHome, $this->_force);
 
         $this->log('Issuing certificate for: ' . $certType);
         $this->log('Command: ' . $cmd);
@@ -1241,18 +1230,7 @@ class AcmeSanCertificateGenerator
             return true; // Assume success in dry-run mode
         }
 
-        // Rate-limit actual ACME requests, but never delay a dry run.
-        static $lastRequest = 0;
-        $now = microtime(true);
-        $elapsed = $now - $lastRequest;
-        if ($elapsed < $this->_rateLimitDelay) {
-            usleep((int) (($this->_rateLimitDelay - $elapsed) * 1000000));
-        }
-        $lastRequest = microtime(true);
-
-        $output = [];
-        $returnCode = 0;
-        exec($cmd . ' 2>&1', $output, $returnCode);
+        [$output, $returnCode] = $this->runAcmeCommand($cmd);
 
         $certificateGenerated = $this->processAcmeResult(
             $certType,
@@ -1267,7 +1245,20 @@ class AcmeSanCertificateGenerator
             $problem = $this->checkCertificateSet($this->readCertificateFiles($certHome), $sanDomains, 'installed certificate');
             if ($problem !== null) {
                 $this->log($problem);
-                $certificateGenerated = $this->restoreAcmeCertificate($certType, $sanDomains, $certHome);
+                $restored = $this->restoreAcmeCertificate($certType, $sanDomains, $certHome);
+                $certificateGenerated = $restored === true;
+
+                // acme.sh saves the new domain list before ordering, so a failed issue
+                // leaves it skipping with an older certificate until the renewal date.
+                // The requested names really changed, so a forced reissue is justified.
+                if ($restored === null) {
+                    $this->log('acme.sh holds no usable certificate for the requested names. Forcing a reissue for: ' . $certType);
+                    $cmd = $this->buildAcmeCommand($sanDomains, $certHome, true);
+                    $this->log('Command: ' . $cmd);
+
+                    [$output, $returnCode] = $this->runAcmeCommand($cmd);
+                    $certificateGenerated = $this->processAcmeResult($certType, $sanDomains, $output, $returnCode);
+                }
             }
         }
 
@@ -1277,6 +1268,57 @@ class AcmeSanCertificateGenerator
         echo "\n"; // Add spacing between certificate types
 
         return $certificateGenerated;
+    }
+
+    /**
+     * Build the acme.sh issue command for a domain set.
+     *
+     * @param array   $sanDomains List of domains for certificate
+     * @param string  $certHome   Directory to store certificates
+     * @param boolean $force      Whether to pass --force
+     *
+     * @return string Shell command
+     */
+    private function buildAcmeCommand(array $sanDomains, string $certHome, bool $force): string
+    {
+        // https://github.com/acmesh-official/acme.sh/wiki/Options-and-Params
+        $cmd = escapeshellarg($this->_acmeScriptPath) . ' --issue';
+        if ($force) {
+            $cmd .= ' --force';
+        }
+        $cmd .= ' --server ' . escapeshellarg($this->_acmeCA);
+        $cmd .= ' --keylength ' . escapeshellarg((string) $this->_acmeKeyLength);
+        $cmd .= ' -d ' . implode(' -d ', array_map('escapeshellarg', $sanDomains));
+        $cmd .= ' -w ' . escapeshellarg($this->_acmeWebRoot);
+        $cmd .= ' --cert-home ' . escapeshellarg($certHome);
+        $cmd .= ' --cert-file ' . escapeshellarg($certHome . '/cert.pem');
+        $cmd .= ' --key-file ' . escapeshellarg($certHome . '/key.pem');
+        $cmd .= ' --fullchain-file ' . escapeshellarg($certHome . '/fullchain.pem');
+
+        return $cmd;
+    }
+
+    /**
+     * Run an acme.sh command, spacing out consecutive requests.
+     *
+     * @param string $cmd Shell command
+     *
+     * @return array Output lines and exit status
+     */
+    private function runAcmeCommand(string $cmd): array
+    {
+        static $lastRequest = 0;
+        $elapsed = microtime(true) - $lastRequest;
+        if ($elapsed < $this->_rateLimitDelay) {
+            usleep((int) (($this->_rateLimitDelay - $elapsed) * 1000000));
+        }
+        $lastRequest = microtime(true);
+
+        $output = [];
+        $returnCode = 0;
+        exec($cmd . ' 2>&1', $output, $returnCode);
+
+        return [$output, $returnCode];
     }
 
     /**
@@ -1308,9 +1350,10 @@ class AcmeSanCertificateGenerator
      * @param array  $sanDomains Requested certificate names
      * @param string $certHome   Certificate directory
      *
-     * @return boolean True when the stored certificate was reinstalled
+     * @return boolean|null True when reinstalled, false when the files could not be
+     *                      replaced, null when acme.sh holds no usable certificate
      */
-    private function restoreAcmeCertificate(string $certType, array $sanDomains, string $certHome): bool
+    private function restoreAcmeCertificate(string $certType, array $sanDomains, string $certHome): ?bool
     {
         $this->log('Reinstalling the certificate acme.sh holds for: ' . $certType);
 
@@ -1321,7 +1364,6 @@ class AcmeSanCertificateGenerator
             $stateDirectories = array_reverse($stateDirectories);
         }
 
-        $problems = [];
         foreach ($stateDirectories as $stateDirectory) {
             if (!is_dir($stateDirectory)) {
                 continue;
@@ -1334,7 +1376,7 @@ class AcmeSanCertificateGenerator
             ]);
             $problem = $this->checkCertificateSet($files, $sanDomains, 'stored certificate in ' . $stateDirectory);
             if ($problem !== null) {
-                $problems[] = $problem;
+                $this->log($problem);
                 continue;
             }
 
@@ -1345,17 +1387,11 @@ class AcmeSanCertificateGenerator
             return true;
         }
 
-        $this->log('Certificate reinstall failed for: ' . $certType);
-        $this->_errors[] = [
-            'type'        => 'certificate_generation',
-            'cert_type'   => $certType,
-            'return_code' => self::ACME_RENEWAL_SKIPPED,
-            'output'      => "acme.sh skipped renewal, but the installed certificate doesn't match the requested names and no usable stored certificate was found. Run with --force --certificate={$certType}.\n"
-                . (empty($problems) ? 'No acme.sh state directory found for ' . $mainDomain : implode("\n", $problems)),
-            'domains'     => $sanDomains,
-        ];
+        if (!is_dir($stateDirectories[0]) && !is_dir($stateDirectories[1])) {
+            $this->log('No acme.sh state directory found for ' . $mainDomain . ' in ' . $certHome);
+        }
 
-        return false;
+        return null;
     }
 
     /**
